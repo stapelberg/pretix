@@ -5,7 +5,6 @@ from django.db.models import Count
 
 
 def change_unique_identifiers(apps, schema_editor):
-    # We cannot really know if a position was bundled or an add-on, but we can at least guess
     Question = apps.get_model("pretixbase", "Question")
 
     for r in Question.objects.values('event', 'identifier').order_by().annotate(c=Count('*')).filter(c__gt=1):
