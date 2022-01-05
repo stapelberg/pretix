@@ -235,6 +235,7 @@ setup(
     ],
     extras_require={
         'dev': [
+            'aiohttp==3.8.*',
             'coverage',
             'coveralls',
             'django-debug-toolbar==3.2.*',
@@ -243,8 +244,7 @@ setup(
             'isort==5.10.*',
             'pep8-naming==0.12.*',
             'potypo',
-            'pycodestyle==2.8.*',
-            'pyflakes==2.4.*',
+            'pytest-asyncio',
             'pytest-cache',
             'pytest-cov',
             'pytest-django==4.*',
