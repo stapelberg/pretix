@@ -35,10 +35,13 @@
 
 import json
 import logging
+import operator
 import sys
 from collections import Counter, defaultdict, namedtuple
 from datetime import datetime, time, timedelta
 from decimal import Decimal
+from functools import reduce
+from time import sleep
 from typing import List, Optional
 
 from celery.exceptions import MaxRetriesExceededError
@@ -81,7 +84,7 @@ from pretix.base.services import tickets
 from pretix.base.services.invoices import (
     generate_cancellation, generate_invoice, invoice_qualified,
 )
-from pretix.base.services.locking import LockTimeoutException, NoLockManager
+from pretix.base.services.locking import LockTimeoutException, lock_objects
 from pretix.base.services.mail import SendMailException
 from pretix.base.services.memberships import (
     create_membership, validate_memberships_in_order,
@@ -99,6 +102,7 @@ from pretix.base.signals import (
 from pretix.celery_app import app
 from pretix.helpers.models import modelcopy
 from pretix.helpers.periodic import minimum_interval
+from pretix.testutils.middleware import storage as debug_storage
 
 error_messages = {
     'unavailable': _('Some of the products you selected were no longer available. '
@@ -583,6 +587,23 @@ def _check_positions(event: Event, now_dt: datetime, positions: List[CartPositio
 
     sorted_positions = sorted(positions, key=lambda s: -int(s.is_bundled))
 
+    # Create locks
+    if any(cp.expires < now() + timedelta(minutes=2) for cp in sorted_positions):
+        # No need to perform any locking if the cart positions still guarantee everything long enough.
+        full_lock_required = any(
+            getattr(o, 'seat', False) for o in sorted_positions
+        ) and event.settings.seating_minimal_distance > 0
+        if full_lock_required:
+            # We lock the entire event in this case since we don't want to deal with fine-granular locking
+            # in the case of seating distance enforcement
+            lock_objects([event])
+        else:
+            lock_objects(
+                [q for q in reduce(operator.or_, (set(cp.quotas) for cp in sorted_positions), set()) if q.size is not None] +
+                [op.voucher for op in sorted_positions if op.voucher] +
+                [op.seat for op in sorted_positions if op.seat]
+            )
+
     # Check availability
     for i, cp in enumerate(sorted_positions):
         if cp.pk in deleted_positions:
@@ -604,6 +625,7 @@ def _check_positions(event: Event, now_dt: datetime, positions: List[CartPositio
 
         if cp.voucher:
             if cp.voucher not in v_avail:
+                cp.voucher.refresh_from_db(fields=['redeemed'])
                 redeemed_in_carts = CartPosition.objects.filter(
                     Q(voucher=cp.voucher) & Q(event=event) & Q(expires__gte=now_dt)
                 ).exclude(cart_id=cp.cart_id)
@@ -814,111 +836,110 @@ def _create_order(event: Event, email: str, positions: List[CartPosition], now_d
     p = None
     sales_channel = get_all_sales_channels()[sales_channel]
 
-    with transaction.atomic():
-        checked_gift_cards = []
-        if gift_cards:
-            gc_qs = GiftCard.objects.select_for_update().filter(pk__in=gift_cards)
-            for gc in gc_qs:
-                if gc.currency != event.currency:
-                    raise OrderError(_("This gift card does not support this currency."))
-                if gc.testmode and not event.testmode:
-                    raise OrderError(_("This gift card can only be used in test mode."))
-                if not gc.testmode and event.testmode:
-                    raise OrderError(_("Only test gift cards can be used in test mode."))
-                if not gc.accepted_by(event.organizer):
-                    raise OrderError(_("This gift card is not accepted by this event organizer."))
-                checked_gift_cards.append(gc)
-        if checked_gift_cards and any(c.item.issue_giftcard for c in positions):
-            raise OrderError(_("You cannot pay with gift cards when buying a gift card."))
+    checked_gift_cards = []
+    if gift_cards:
+        gc_qs = GiftCard.objects.select_for_update().filter(pk__in=gift_cards)
+        for gc in gc_qs:
+            if gc.currency != event.currency:
+                raise OrderError(_("This gift card does not support this currency."))
+            if gc.testmode and not event.testmode:
+                raise OrderError(_("This gift card can only be used in test mode."))
+            if not gc.testmode and event.testmode:
+                raise OrderError(_("Only test gift cards can be used in test mode."))
+            if not gc.accepted_by(event.organizer):
+                raise OrderError(_("This gift card is not accepted by this event organizer."))
+            checked_gift_cards.append(gc)
+    if checked_gift_cards and any(c.item.issue_giftcard for c in positions):
+        raise OrderError(_("You cannot pay with gift cards when buying a gift card."))
 
-        try:
-            validate_memberships_in_order(customer, positions, event, lock=True, testmode=event.testmode)
-        except ValidationError as e:
-            raise OrderError(e.message)
+    try:
+        validate_memberships_in_order(customer, positions, event, lock=True, testmode=event.testmode)
+    except ValidationError as e:
+        raise OrderError(e.message)
 
-        fees, pf, gift_card_values = _get_fees(positions, payment_provider, address, meta_info, event, checked_gift_cards)
-        total = pending_sum = sum([c.price for c in positions]) + sum([c.value for c in fees])
+    fees, pf, gift_card_values = _get_fees(positions, payment_provider, address, meta_info, event, checked_gift_cards)
+    total = pending_sum = sum([c.price for c in positions]) + sum([c.value for c in fees])
 
-        order = Order(
-            status=Order.STATUS_PENDING,
-            event=event,
-            email=email,
-            phone=(meta_info or {}).get('contact_form_data', {}).get('phone'),
-            datetime=now_dt,
-            locale=get_language_without_region(locale),
-            total=total,
-            testmode=True if sales_channel.testmode_supported and event.testmode else False,
-            meta_info=json.dumps(meta_info or {}),
-            require_approval=any(p.requires_approval(invoice_address=address) for p in positions),
-            sales_channel=sales_channel.identifier,
-            customer=customer,
-        )
-        if customer:
-            order.email_known_to_work = customer.is_verified
-        order.set_expires(now_dt, event.subevents.filter(id__in=[p.subevent_id for p in positions]))
+    order = Order(
+        status=Order.STATUS_PENDING,
+        event=event,
+        email=email,
+        phone=(meta_info or {}).get('contact_form_data', {}).get('phone'),
+        datetime=now_dt,
+        locale=get_language_without_region(locale),
+        total=total,
+        testmode=True if sales_channel.testmode_supported and event.testmode else False,
+        meta_info=json.dumps(meta_info or {}),
+        require_approval=any(p.requires_approval(invoice_address=address) for p in positions),
+        sales_channel=sales_channel.identifier,
+        customer=customer,
+    )
+    if customer:
+        order.email_known_to_work = customer.is_verified
+    order.set_expires(now_dt, event.subevents.filter(id__in=[p.subevent_id for p in positions]))
+    order.save()
+
+    if address:
+        if address.order is not None:
+            address.pk = None
+        address.order = order
+        address.save()
+
         order.save()
 
-        if address:
-            if address.order is not None:
-                address.pk = None
-            address.order = order
-            address.save()
+    for fee in fees:
+        fee.order = order
+        fee._calculate_tax()
+        if fee.tax_rule and not fee.tax_rule.pk:
+            fee.tax_rule = None  # TODO: deprecate
+        fee.save()
 
-            order.save()
+    for gc, val in gift_card_values.items():
+        p = order.payments.create(
+            state=OrderPayment.PAYMENT_STATE_CONFIRMED,
+            provider='giftcard',
+            amount=val,
+            fee=pf
+        )
+        trans = gc.transactions.create(
+            value=-1 * val,
+            order=order,
+            payment=p
+        )
+        p.info_data = {
+            'gift_card': gc.pk,
+            'transaction_id': trans.pk,
+        }
+        p.save()
+        pending_sum -= val
 
-        for fee in fees:
-            fee.order = order
-            fee._calculate_tax()
-            if fee.tax_rule and not fee.tax_rule.pk:
-                fee.tax_rule = None  # TODO: deprecate
-            fee.save()
-
-        for gc, val in gift_card_values.items():
-            p = order.payments.create(
-                state=OrderPayment.PAYMENT_STATE_CONFIRMED,
-                provider='giftcard',
-                amount=val,
-                fee=pf
-            )
-            trans = gc.transactions.create(
-                value=-1 * val,
-                order=order,
-                payment=p
-            )
-            p.info_data = {
-                'gift_card': gc.pk,
-                'transaction_id': trans.pk,
-            }
-            p.save()
-            pending_sum -= val
-
-        # Safety check: Is the amount we're now going to charge the same amount the user has been shown when they
-        # pressed "Confirm purchase"? If not, we should better warn the user and show the confirmation page again.
-        # The only *known* case where this happens is if a gift card is used in two concurrent sessions.
-        if shown_total is not None:
-            if Decimal(shown_total) != pending_sum:
-                raise OrderError(
-                    _('While trying to place your order, we noticed that the order total has changed. Either one of '
-                      'the prices changed just now, or a gift card you used has been used in the meantime. Please '
-                      'check the prices below and try again.')
-                )
-
-        if payment_provider and not order.require_approval:
-            p = order.payments.create(
-                state=OrderPayment.PAYMENT_STATE_CREATED,
-                provider=payment_provider.identifier,
-                amount=pending_sum,
-                fee=pf
+    # Safety check: Is the amount we're now going to charge the same amount the user has been shown when they
+    # pressed "Confirm purchase"? If not, we should better warn the user and show the confirmation page again.
+    # The only *known* case where this happens is if a gift card is used in two concurrent sessions.
+    if shown_total is not None:
+        if Decimal(shown_total) != pending_sum:
+            raise OrderError(
+                _('While trying to place your order, we noticed that the order total has changed. Either one of '
+                  'the prices changed just now, or a gift card you used has been used in the meantime. Please '
+                  'check the prices below and try again.')
             )
 
-        orderpositions = OrderPosition.transform_cart_positions(positions, order)
-        order.create_transactions(positions=orderpositions, fees=fees, is_new=True)
-        order.log_action('pretix.event.order.placed')
-        if order.require_approval:
-            order.log_action('pretix.event.order.placed.require_approval')
-        if meta_info:
-            for msg in meta_info.get('confirm_messages', []):
-                order.log_action('pretix.event.order.consent', data={'msg': msg})
+    if payment_provider and not order.require_approval:
+        p = order.payments.create(
+            state=OrderPayment.PAYMENT_STATE_CREATED,
+            provider=payment_provider.identifier,
+            amount=pending_sum,
+            fee=pf
+        )
+
+    orderpositions = OrderPosition.transform_cart_positions(positions, order)
+    order.create_transactions(positions=orderpositions, fees=fees, is_new=True)
+    order.log_action('pretix.event.order.placed')
+    if order.require_approval:
+        order.log_action('pretix.event.order.placed.require_approval')
+    if meta_info:
+        for msg in meta_info.get('confirm_messages', []):
+            order.log_action('pretix.event.order.consent', data={'msg': msg})
 
     order_placed.send(event, order=order)
     return order, p
@@ -1003,15 +1024,8 @@ def _perform_order(event: Event, payment_provider: str, position_ids: List[str],
     validate_order.send(event, payment_provider=pprov, email=email, positions=positions, locale=locale,
                         invoice_address=addr, meta_info=meta_info, customer=customer)
 
-    lockfn = NoLockManager
-    locked = False
-    if positions.filter(Q(voucher__isnull=False) | Q(expires__lt=now() + timedelta(minutes=2)) | Q(seat__isnull=False)).exists():
-        # Performance optimization: If no voucher is used and no cart position is dangerously close to its expiry date,
-        # creating this order shouldn't be prone to any race conditions and we don't need to lock the event.
-        locked = True
-        lockfn = event.lock
-
-    with lockfn() as now_dt:
+    now_dt = now()
+    with transaction.atomic(durable=True):
         positions = list(
             positions.select_related('item', 'variation', 'subevent', 'seat', 'addon_to').prefetch_related('addons')
         )
@@ -1021,6 +1035,10 @@ def _perform_order(event: Event, payment_provider: str, position_ids: List[str],
         if len(position_ids) != len(positions):
             raise OrderError(error_messages['internal'])
         _check_positions(event, now_dt, positions, address=addr, sales_channel=sales_channel, customer=customer)
+
+        if 'sleep-after-quota-check' in debug_storage.debugflags:
+            sleep(2)
+
         order, payment = _create_order(event, email, positions, now_dt, pprov,
                                        locale=locale, address=addr, meta_info=meta_info, sales_channel=sales_channel,
                                        gift_cards=gift_cards, shown_total=shown_total, customer=customer)
@@ -1028,7 +1046,7 @@ def _perform_order(event: Event, payment_provider: str, position_ids: List[str],
         free_order_flow = payment and payment_provider == 'free' and order.pending_sum == Decimal('0.00') and not order.require_approval
         if free_order_flow:
             try:
-                payment.confirm(send_mail=False, lock=not locked)
+                payment.confirm(send_mail=False, lock=False)
             except Quota.QuotaExceededException:
                 pass
 
