@@ -51,6 +51,7 @@ from pytz import common_timezones
 
 from pretix.api.models import WebHook
 from pretix.api.webhooks import get_all_webhook_events
+from pretix.base.customersso.oidc import oidc_validate_and_complete_config
 from pretix.base.forms import I18nModelForm, PlaceholderValidator, SettingsForm
 from pretix.base.forms.questions import (
     NamePartsFormField, WrappedPhoneNumberPrefixWidget, get_country_by_locale,
@@ -61,6 +62,7 @@ from pretix.base.models import (
     Customer, Device, EventMetaProperty, Gate, GiftCard, Membership,
     MembershipType, Organizer, Team,
 )
+from pretix.base.models.customers import CustomerSSOProvider
 from pretix.base.models.organizer import OrganizerFooterLink
 from pretix.base.settings import PERSON_NAME_SCHEMES, PERSON_NAME_TITLE_GROUPS
 from pretix.control.forms import ExtFileField, SplitDateTimeField
@@ -706,3 +708,80 @@ OrganizerFooterLinkFormset = inlineformset_factory(
     formset=BaseOrganizerFooterLinkFormSet,
     can_order=False, can_delete=True, extra=0
 )
+
+
+class SSOProviderForm(I18nModelForm):
+
+    config_oidc_base_url = forms.URLField(
+        label=pgettext_lazy('sso_oidc', 'Base URL'),
+        required=False,
+    )
+    config_oidc_client_id = forms.CharField(
+        label=pgettext_lazy('sso_oidc', 'Client ID'),
+        required=False,
+    )
+    config_oidc_client_secret = forms.CharField(
+        label=pgettext_lazy('sso_oidc', 'Client secret'),
+        required=False,
+    )
+    config_oidc_scope = forms.CharField(
+        label=pgettext_lazy('sso_oidc', 'Scope'),
+        help_text=pgettext_lazy('sso_oidc', 'Multiple scopes separated with spaces.'),
+        required=False,
+    )
+    config_oidc_uid_field = forms.CharField(
+        label=pgettext_lazy('sso_oidc', 'User ID field'),
+        required=False,
+        initial='sub',
+    )
+    config_oidc_email_field = forms.CharField(
+        label=pgettext_lazy('sso_oidc', 'Email field'),
+        required=False,
+        initial='email',
+    )
+    config_oidc_phone_field = forms.CharField(
+        label=pgettext_lazy('sso_oidc', 'Phone field'),
+        required=False,
+    )
+
+    class Meta:
+        model = CustomerSSOProvider
+        fields = ['is_active', 'name', 'button_label', 'method']
+        widgets = {
+            'method': forms.RadioSelect,
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        name_scheme = self.event.settings.name_scheme
+        scheme = PERSON_NAME_SCHEMES.get(name_scheme)
+        for fname, label, size in scheme['fields']:
+            self.fields[f'config_oidc_{fname}_field'] = forms.CharField(
+                label=pgettext_lazy('sso_oidc', f'{label} field').format(label=label),
+                required=False,
+            )
+
+        for fname, f in self.fields.items():
+            if fname.startswith('config_'):
+                prefix, method, suffix = fname.split('_', 2)
+                f.widget.attrs['data-display-dependency'] = f'input[name=method][value={method}]'
+
+                if self.instance and self.instance.method == method:
+                    f.initial = self.instance.configuration.get(suffix)
+
+    def clean(self):
+        data = self.cleaned_data
+        if not data.get("method"):
+            return data
+
+        config = {}
+        for fname, f in self.fields.items():
+            if fname.startswith(f'config_{data["method"]}_'):
+                prefix, method, suffix = fname.split('_', 2)
+                config[suffix] = data.get(fname)
+
+        if data["method"] == "oidc":
+            oidc_validate_and_complete_config(config)
+
+        self.instance.configuration = config

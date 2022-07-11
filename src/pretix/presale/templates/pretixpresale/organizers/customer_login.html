@@ -20,6 +20,13 @@
                         {% trans "Log in" %}
                     </button>
                 </div>
+                {% for provider in request.organizer.sso_providers.all %}
+                    {% if provider.is_active %}
+                        <a href="{% eventurl request.organizer "presale:organizer.customer.login" provider=provider.pk %}?{{ request.META.QUERY_STRING }}" class="btn btn-primary btn-lg btn-block">
+                           {{ provider.button_label }}
+                        </a>
+                    {% endif %}
+                {% endfor %}
                 <div class="row">
                     <div class="col-md-6">
                         <a class="btn btn-link btn-block" href="{% eventurl request.organizer "presale:organizer.customer.register" %}">

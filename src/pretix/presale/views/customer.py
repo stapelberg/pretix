@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import hashlib
 from importlib import import_module
 from urllib.parse import (
     parse_qs, quote, urlencode, urljoin, urlparse, urlsplit, urlunparse,
@@ -26,11 +27,13 @@ from urllib.parse import (
 
 from django.conf import settings
 from django.contrib import messages
+from django.core.exceptions import ValidationError
 from django.core.signing import BadSignature, dumps, loads
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, IntegerField, OuterRef, Q, Subquery
 from django.http import Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
+from django.utils.crypto import get_random_string
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
 from django.utils.http import url_has_allowed_host_and_scheme
@@ -40,8 +43,12 @@ from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.debug import sensitive_post_parameters
 from django.views.generic import DeleteView, FormView, ListView, View
 
+from pretix.base.customersso.oidc import (
+    oidc_authorize_url, oidc_validate_authorization,
+)
 from pretix.base.models import Customer, InvoiceAddress, Order, OrderPosition
 from pretix.base.services.mail import mail
+from pretix.base.settings import PERSON_NAME_SCHEMES
 from pretix.multidomain.models import KnownDomain
 from pretix.multidomain.urlreverse import build_absolute_uri, eventreverse
 from pretix.presale.forms.customer import (
@@ -58,9 +65,9 @@ SessionStore = import_module(settings.SESSION_ENGINE).SessionStore
 class RedirectBackMixin:
     redirect_field_name = 'next'
 
-    def get_redirect_url(self):
+    def get_redirect_url(self, redirect_to=None):
         """Return the user-originating redirect URL if it's safe."""
-        redirect_to = self.request.POST.get(
+        redirect_to = redirect_to or self.request.POST.get(
             self.redirect_field_name,
             self.request.GET.get(self.redirect_field_name, '')
         )
@@ -541,3 +548,205 @@ class ConfirmChangeView(View):
 
     def get_success_url(self):
         return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+
+
+class SSOLoginView(RedirectBackMixin, View):
+    """
+    Start logging in with a SSO provider.
+    """
+    form_class = AuthenticationForm
+    redirect_authenticated_user = True
+
+    @method_decorator(sensitive_post_parameters())
+    @method_decorator(csrf_protect)
+    @method_decorator(never_cache)
+    def dispatch(self, request, *args, **kwargs):
+        if not request.organizer.settings.customer_accounts:
+            raise Http404('Feature not enabled')
+        if self.redirect_authenticated_user and self.request.customer:
+            redirect_to = self.get_success_url()
+            if redirect_to == self.request.path:
+                raise ValueError(
+                    "Redirection loop for authenticated user detected. Check that "
+                    "your LOGIN_REDIRECT_URL doesn't point to a login page."
+                )
+            return HttpResponseRedirect(redirect_to)
+        return super().dispatch(request, *args, **kwargs)
+
+    @cached_property
+    def provider(self):
+        return get_object_or_404(self.request.organizer.sso_providers.filter(is_active=True), pk=self.kwargs['provider'])
+
+    def get(self, request, *args, **kwargs):
+        next_url = request.GET.get('next')
+        nonce = get_random_string(32)
+        request.session[f'pretix_customerauth_{self.provider.pk}_nonce'] = nonce
+        redirect_uri = build_absolute_uri(self.request.organizer, 'presale:organizer.customer.login.return', kwargs={
+            'provider': self.provider.pk
+        })
+
+        if self.provider.method == "oidc":
+            return redirect(oidc_authorize_url(self.provider, f'{nonce}#{next_url}', redirect_uri))
+        else:
+            raise Http404("Unknown SSO method.")
+
+    def get_success_url(self):
+        url = self.get_redirect_url()
+
+        if not url:
+            return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+        return url
+
+
+class SSOLoginReturnView(RedirectBackMixin, View):
+    """
+    Start logging in with a SSO provider.
+    """
+    form_class = AuthenticationForm
+    redirect_authenticated_user = True
+
+    @method_decorator(sensitive_post_parameters())
+    @method_decorator(csrf_protect)
+    @method_decorator(never_cache)
+    def dispatch(self, request, *args, **kwargs):
+        if not request.organizer.settings.customer_accounts:
+            raise Http404('Feature not enabled')
+        if self.redirect_authenticated_user and self.request.customer:
+            redirect_to = self.get_success_url()
+            if redirect_to == self.request.path:
+                raise ValueError(
+                    "Redirection loop for authenticated user detected. Check that "
+                    "your LOGIN_REDIRECT_URL doesn't point to a login page."
+                )
+            return HttpResponseRedirect(redirect_to)
+        return super().dispatch(request, *args, **kwargs)
+
+    @cached_property
+    def provider(self):
+        return get_object_or_404(self.request.organizer.sso_providers.filter(is_active=True), pk=self.kwargs['provider'])
+
+    def get(self, request, *args, **kwargs):
+        redirect_to = None
+        if self.provider.method == "oidc":
+            if not request.GET.get('state'):
+                messages.error(
+                    request,
+                    _('Login was not successful. Error message: "{error}".').format(
+                        error='state parameter missing',
+                    )
+                )
+                return redirect(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+
+            nonce, redirect_to = request.GET['state'].split('#')
+            if nonce != request.session[f'pretix_customerauth_{self.provider.pk}_nonce']:
+                messages.error(
+                    request,
+                    _('Login was not successful. Error message: "{error}".').format(
+                        error='invalid nonce',
+                    )
+                )
+                return redirect(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+            redirect_uri = build_absolute_uri(
+                self.request.organizer, 'presale:organizer.customer.login.return',
+                kwargs={
+                    'provider': self.provider.pk
+                }
+            )
+            try:
+                profile = oidc_validate_authorization(
+                    self.provider,
+                    request.GET.get('code'),
+                    redirect_uri,
+                )
+            except ValidationError as e:
+                for msg in e:
+                    messages.error(request, msg)
+                return redirect(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+        else:
+            raise Http404("Unknown SSO method.")
+
+        identifier = hashlib.sha256(
+            profile['uid'].encode() + b'@' + str(self.provider.pk).encode()
+        ).hexdigest().upper()[:settings.ENTROPY['customer_identifier']]
+        if "1" not in identifier and "0" not in identifier:
+            # This is a hack to make sure the hash space does not overlap with the random identifiers generated by
+            # Customer.assign_identifier()
+            identifier = identifier[:4] + "1" + identifier[4:-1]
+
+        try:
+            customer = self.request.organizer.customers.get(
+                provider=self.provider,
+                identifier=identifier,
+            )
+        except Customer.MultipleObjectsReturned:
+            messages.error(
+                request,
+                _('Login was not successful. Error message: "{error}".').format(
+                    error='identifier not unique',
+                )
+            )
+            return redirect(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+        except Customer.DoesNotExist:
+            name_scheme = self.request.organizer.settings.name_scheme
+            name_parts = {
+                '_scheme': name_scheme,
+            }
+            scheme = PERSON_NAME_SCHEMES.get(name_scheme)
+            for fname, label, size in scheme['fields']:
+                if fname in profile:
+                    name_parts[fname] = profile[fname]
+            if len(name_parts) == 1 and profile.get('name'):
+                name_parts = {'_legacy': profile['name']}
+            customer = Customer(
+                organizer=self.request.organizer,
+                identifier=identifier,
+                external_identifier=profile['uid'],
+                provider=self.provider,
+                email=profile['email'],
+                phone=profile.get('phone') or None,
+                name_parts=name_parts,
+                is_active=True,
+                is_verified=True,  # todo: alaways?
+                locale=request.LANGUAGE_CODE,
+            )
+            try:
+                customer.save(force_insert=True)
+            except IntegrityError:
+                # This might either be a race condition or the email address is taken
+                # by a different customer account
+                try:
+                    customer = self.request.organizer.customers.get(
+                        provider=self.provider,
+                        identifier=identifier,
+                    )
+                except Customer.DoesNotExist:
+                    messages.error(
+                        request,
+                        _('We were unable to use your login since the email address is already used for a different '
+                          'account in this system.')
+                    )
+                    return redirect(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+
+        if not customer.is_active:
+            messages.error(
+                request,
+                AuthenticationForm.error_messages['inactive'],
+            )
+            return redirect(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+
+        if not customer.is_verified:
+            messages.error(
+                request,
+                AuthenticationForm.error_messages['unverified'],
+            )
+            return redirect(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+
+        customer_login(self.request, customer)
+        return redirect(self.get_success_url())
+
+    def get_success_url(self):
+        url = self.get_redirect_url()
+
+        if not url:
+            return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+        return url
