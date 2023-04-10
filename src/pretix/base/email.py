@@ -36,6 +36,7 @@ from django.template.loader import get_template
 from django.utils.formats import date_format
 from django.utils.timezone import now
 from django.utils.translation import get_language, gettext_lazy as _
+from pytz import timezone
 
 from pretix.base.i18n import (
     LazyCurrencyNumber, LazyDate, LazyExpiresDate, LazyNumber,
@@ -355,6 +356,24 @@ def get_best_name(position_or_address, parts=False):
     return {} if parts else ""
 
 
+def _event_date_from(order, event):
+    op = order.positions.first()
+    ev = (op.subevent if op else None) or event
+    return str(date_format(
+        ev.date_from.astimezone(timezone(ev.settings.timezone)),
+        'SHORT_DATETIME_FORMAT'
+    ))
+
+
+def _event_time_from(order, event):
+    op = order.positions.first()
+    ev = (op.subevent if op else None) or event
+    return str(date_format(
+        ev.date_from.astimezone(timezone(ev.settings.timezone)),
+        'TIME_FORMAT'
+    ))
+
+
 @receiver(register_mail_placeholders, dispatch_uid="pretixbase_register_mail_placeholders")
 def base_placeholders(sender, **kwargs):
     from pretix.multidomain.urlreverse import build_absolute_uri
@@ -503,6 +522,22 @@ def base_placeholders(sender, **kwargs):
         SimpleFunctionalMailTextPlaceholder(
             'event_location', ['event_or_subevent'], lambda event_or_subevent: str(event_or_subevent.location or ''),
             lambda event: str(event.location or ''),
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'event_date_from', ['order', 'event'],
+            _event_date_from,
+            lambda event: str(date_format(
+                event.date_from,
+                'SHORT_DATETIME_FORMAT'
+            )),
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'event_time_from', ['order', 'event'],
+            _event_time_from,
+            lambda event: str(date_format(
+                event.date_from,
+                'TIME_FORMAT'
+            )),
         ),
         SimpleFunctionalMailTextPlaceholder(
             'event_admission_time', ['event_or_subevent'],
